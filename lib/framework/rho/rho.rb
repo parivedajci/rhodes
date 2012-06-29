@@ -1254,6 +1254,12 @@ module SyncEngine
         Object.const_get(src_name).on_sync_create_error(objects, action)
     end
 
+    def self.push_changes( src_name )
+        raise ArgumentError, 'on_sync_create_error src_name should be string' unless src_name.is_a?(String)
+        
+        Object.const_get(src_name).push_changes()
+    end
+
     def self.on_sync_update_error( src_name, objects, action, rollback_data = nil )
         raise ArgumentError, 'on_sync_update_error src_name should be string' unless src_name.is_a?(String)
     
@@ -1312,7 +1318,7 @@ module Kernel
         Rho::RHO.get_instance().load_model(name.to_s)        
     end
     
-end    
+end
 
 if defined?(RHO_WP7).nil?
 module WebView
