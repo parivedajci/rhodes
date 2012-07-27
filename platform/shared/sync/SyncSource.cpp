@@ -39,6 +39,9 @@
 #include "json/JSONIterator.h"
 #include "statistic/RhoProfiler.h"
 #include "net/URI.h"
+#ifndef RHO_NO_RUBY
+#include "ruby/ext/rho/rhoruby.h"
+#endif //RHO_NO_RUBY
 
 namespace rho {
 namespace sync {
@@ -303,7 +306,10 @@ void CSyncSource::doSyncClientChanges()
     int i = 0;
 
     getDB().Lock();
+    getDB().updateAllAttribChanges();
     checkIgnorePushObjects();
+    if ( getSync().getSourceOptions().getBoolProperty(getID(), "full_update") )
+        getDB().updateFullUpdateChanges( getID() );
 
     for( i = 0; i < 3; i++ )
     {
@@ -345,50 +351,117 @@ void CSyncSource::doSyncClientChanges()
     {
         LOG(INFO) + "Push client changes to server. Source: " + getName() + "Size :" + strBody.length();
         if ( !RHOCONF().getBool("log_skip_post") )
-            LOG(TRACE) + "Push body: " + strBody;		
+            LOG(INFO) + "Push body: " + strBody;		
 
-        if ( m_arMultipartItems.size() > 0 )
+        if ( getSync().getSourceOptions().getBoolProperty(getID(), "set_sync_push_body" ) )
+            getSync().getSourceOptions().setProperty(getID(), "sync_push_body", strBody.c_str() );
+
+        if ( getSync().getSourceOptions().getIntProperty(getID(), "sync_push_error" ) > 0 )
         {
-            CMultipartItem* pItem = new CMultipartItem();
-            CMultipartItem& oItem = *pItem;
-            oItem.m_strBody = strBody;
-            //oItem.m_strContentType = getProtocol().getContentType();
-            oItem.m_strName = "cud";
-            m_arMultipartItems.addElement(pItem);
-
-            NetResponse resp = getNet().pushMultipartData( getProtocol().getClientChangesUrl(), m_arMultipartItems, &getSync(), null);
-            if ( !resp.isOK() )
-            {
-                //getSync().stopSync();
-                m_nErrCode = RhoAppAdapter.getErrorFromResponse(resp);
-                m_strError = resp.getCharData();
-            }
+            m_nErrCode = getSync().getSourceOptions().getIntProperty(getID(), "sync_push_error" );
+            m_strError = getSync().getSourceOptions().getProperty(getID(), "sync_push_error_text" );
         }else
         {
-            NetResponse resp = getNet().pushData( getProtocol().getClientChangesUrl(), strBody, &getSync());
-            if ( !resp.isOK() )
+            if ( m_arMultipartItems.size() > 0 )
             {
-                //getSync().stopSync();
-                m_nErrCode = RhoAppAdapter.getErrorFromResponse(resp);
-                m_strError = resp.getCharData();
+                CMultipartItem* pItem = new CMultipartItem();
+                CMultipartItem& oItem = *pItem;
+                oItem.m_strBody = strBody;
+                //oItem.m_strContentType = getProtocol().getContentType();
+                oItem.m_strName = "cud";
+                m_arMultipartItems.addElement(pItem);
+
+                NetResponse resp = getNet().pushMultipartData( getProtocol().getClientChangesUrl(), m_arMultipartItems, &getSync(), null);
+                if ( !resp.isOK() )
+                {
+                    //getSync().stopSync();
+                    m_nErrCode = RhoAppAdapter.getErrorFromResponse(resp);
+                    m_strError = resp.getCharData();
+                }
+            }else
+            {
+                NetResponse resp = getNet().pushData( getProtocol().getClientChangesUrl(), strBody, &getSync());
+                if ( !resp.isOK() )
+                {
+                    //getSync().stopSync();
+                    m_nErrCode = RhoAppAdapter.getErrorFromResponse(resp);
+                    m_strError = resp.getCharData();
+                }
             }
         }
 
-        for( i = 0; i < 3 && m_nErrCode == RhoAppAdapter.ERR_NONE; i++ )
+#ifndef RHO_NO_RUBY    
+        if ( getSync().isNoThreadedMode() && getSync().getSourceOptions().getProperty(getID(), "sync_push_callback" ).length() > 0 )
+            rho_ruby_callmethod( getSync().getSourceOptions().getProperty(getID(), "sync_push_callback" ).c_str() );
+#endif //RHO_NO_RUBY
+
+        getDB().Lock();
+        for( i = 0; i < 3; i++ )
         {
             if ( arUpdateSent[i] )
             {
-                //oo conflicts
-                if ( i < 1 &&  !getSync().getSourceOptions().getBoolProperty(getID(), "pass_through") ) //create
-                    getDB().executeSQL("UPDATE changed_values SET sent=2 WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
-                else
-                //
-                    getDB().executeSQL("DELETE FROM changed_values WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                if ( m_nErrCode == RhoAppAdapter.ERR_NONE )
+                {
+                    //oo conflicts
+                    if ( i < 1 &&  !getSync().getSourceOptions().getBoolProperty(getID(), "pass_through") ) //create
+                        getDB().executeSQL("UPDATE changed_values SET sent=2 WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                    else
+                    //
+                        getDB().executeSQL("DELETE FROM changed_values WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                }else
+                {
+                    if ( i == 0 ) //create
+                    {
+                        //remove deleted while sync objects
+                        Hashtable<String,int> hashDeletes;
+                        {
+                            IDBResult res = getDB().executeSQL("SELECT distinct(object) FROM changed_values where source_id=? and update_type=? and sent=0", getID(), "delete" );
+                            for( ; !res.isEnd(); res.next() )
+                                hashDeletes.put( res.getStringByIdx(0), 1 );
+                        }
+
+                        Vector<String> arObjs;
+                        IDBResult res = getDB().executeSQL("SELECT distinct(object) FROM changed_values where source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                        for( ; !res.isEnd(); res.next() )
+                            arObjs.addElement( res.getStringByIdx(0) );
+
+                        for ( int j = 0; j < (int)arObjs.size(); j++ )
+                        {
+                            if ( !hashDeletes.containsKey(arObjs[j]) )
+                                getDB().executeSQL("INSERT INTO changed_values(update_type, attrib, source_id, object) VALUES(?,?,?,?)", arUpdateTypes[i], "object", getID(), arObjs[j] );
+                        }
+
+                        for ( int j = 0; j < (int)arObjs.size(); j++ )
+                            getDB().executeSQL("DELETE FROM changed_values WHERE source_id=? and object=? and attrib<>?", getID(), arObjs[j], "object" );
+
+                    }
+                    else if ( i == 1 )//update
+                    {
+                        //remove updates with sent=1 if sent=0 exists
+                        Vector<String> arObjs, arAttribs;
+                        IDBResult res = getDB().executeSQL("SELECT object, attrib FROM changed_values where source_id=? and update_type=? and sent=0", getID(), arUpdateTypes[i] );
+                        for( ; !res.isEnd(); res.next() )
+                        {
+                            arObjs.addElement( res.getStringByIdx(0) );
+                            arAttribs.addElement( res.getStringByIdx(1) );
+                        }
+                        for ( int j = 0; j < (int)arObjs.size(); j++ )
+                        {
+                            getDB().executeSQL("DELETE FROM changed_values WHERE source_id=? and object=? and attrib=? and update_type = ? and sent=1", getID(), arObjs[j], arAttribs[j], arUpdateTypes[i] );
+                        }
+
+                        getDB().executeSQL("UPDATE changed_values SET sent=0 WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                    }
+                    else
+                        getDB().executeSQL("UPDATE changed_values SET sent=0 WHERE source_id=? and update_type=? and sent=1", getID(), arUpdateTypes[i] );
+                }
             }
         }
 
         if (m_nErrCode == RhoAppAdapter.ERR_NONE)
             getDB().executeSQL("DELETE FROM changed_values WHERE source_id=? and update_type=?", getID(), "push_changes" );
+
+        getDB().Unlock();
     }
 
     m_arMultipartItems.removeAllElements();
@@ -417,8 +490,8 @@ void CSyncSource::makePushBody_Ver3(String& strBody, const String& strUpdateType
 {
     getDB().Lock();
 
-    if ( isSync )
-        getDB().updateAllAttribChanges();
+    //if ( isSync )
+    //    getDB().updateAllAttribChanges();
 
     IDBResult res = getDB().executeSQL("SELECT attrib, object, value, attrib_type "
         "FROM changed_values where source_id=? and update_type =? and sent<=1 ORDER BY object", getID(), strUpdateType.c_str() );
@@ -935,8 +1008,8 @@ void CSyncSource::processServerCmd_Ver3_Schema(const String& strCmd, const Strin
                 // oo conflicts
                 for( int i = 0; i < (int)vecAttrs.size(); i++ )
                 {
-                    getDB().executeSQL("UPDATE changed_values SET sent=4 where object=? and attrib=? and source_id=? and sent>1", 
-                        strObject, vecAttrs.elementAt(i), getID() );
+                    getDB().executeSQL("UPDATE changed_values SET sent=4 where object=? and attrib=? and source_id=? and update_type=? and sent>1", 
+                        strObject, vecAttrs.elementAt(i), getID(), "create" );
                 }
                 //
             }
@@ -996,8 +1069,8 @@ void CSyncSource::processServerCmd_Ver3_Schema(const String& strCmd, const Strin
             // oo conflicts
             for( int i = 0; i < (int)vecAttrs.size(); i++ )
             {
-                getDB().executeSQL("UPDATE changed_values SET sent=3 where object=? and attrib=? and source_id=?", 
-                    strObject, vecAttrs.elementAt(i), getID() );
+                getDB().executeSQL("UPDATE changed_values SET sent=3 where object=? and attrib=? and source_id=? and update_type=?", 
+                    strObject, vecAttrs.elementAt(i), getID(), "create" );
             }
             //
         }
@@ -1012,7 +1085,7 @@ void CSyncSource::processServerCmd_Ver3_Schema(const String& strCmd, const Strin
         strSqlUpdate += getName() + " SET object=? WHERE object=?";
         getDB().executeSQL(strSqlUpdate.c_str(), strValue, strObject);
 
-        getDB().executeSQL("UPDATE changed_values SET object=?,sent=3 where object=? and source_id=?", strValue, strObject, getID() );
+        getDB().executeSQL("UPDATE changed_values SET object=?,sent=3 where object=? and source_id=? and update_type=?", strValue, strObject, getID(), "create" );
         getNotify().onObjectChanged(getID(), strObject, CSyncNotify::enCreate);
     }
 
@@ -1091,8 +1164,8 @@ void CSyncSource::processServerCmd_Ver3(const String& strCmd, const String& strO
             if ( getSyncType().compare("none") != 0 )
             {
                 // oo conflicts
-                getDB().executeSQL("UPDATE changed_values SET sent=4 where object=? and attrib=? and source_id=? and sent>1", 
-                    strObject, oAttrValue.m_strAttrib, getID() );
+                getDB().executeSQL("UPDATE changed_values SET sent=4 where object=? and attrib=? and source_id=? and update_type=? and sent>1", 
+                    strObject, oAttrValue.m_strAttrib, getID(), "create" );
                 //
             }
         }
@@ -1109,7 +1182,7 @@ void CSyncSource::processServerCmd_Ver3(const String& strCmd, const String& strO
         {
             getNotify().onObjectChanged(getID(), strObject, CSyncNotify::enDelete);
             // oo conflicts
-            getDB().executeSQL("UPDATE changed_values SET sent=3 where object=? and attrib=? and source_id=?", strObject, oAttrValue.m_strAttrib, getID() );
+            getDB().executeSQL("UPDATE changed_values SET sent=3 where object=? and attrib=? and update_type=? and source_id=?", strObject, oAttrValue.m_strAttrib, getID(), "create" );
             //
         }
 
@@ -1119,7 +1192,7 @@ void CSyncSource::processServerCmd_Ver3(const String& strCmd, const String& strO
         processAssociations(strObject, oAttrValue.m_strValue);
 
         getDB().executeSQL("UPDATE object_values SET object=? where object=? and source_id=?", oAttrValue.m_strValue, strObject, getID() );
-        getDB().executeSQL("UPDATE changed_values SET object=?,sent=3 where object=? and source_id=?", oAttrValue.m_strValue, strObject, getID() );
+        getDB().executeSQL("UPDATE changed_values SET object=?,sent=3 where object=? and source_id=? and update_type=?", oAttrValue.m_strValue, strObject, getID(), "create" );
 
         getNotify().onObjectChanged(getID(), strObject, CSyncNotify::enCreate);
     }
